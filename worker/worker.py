@@ -41,14 +41,20 @@ def list_new_uploads():
     resp = s3.list_objects_v2(Bucket=BUCKET, Prefix="uploads/")
     for obj in resp.get("Contents", []):
         key = obj["Key"]
-        if not key.lower().endswith(".pdf"):      # ← skip “folder objects”
+
+        # --- NEW GUARD -------------------------------------------------
+        if obj["Size"] < 1024:  # skip anything <1 KB
+            print(f"⚠️  Skip {key}: {obj['Size']} bytes")
             continue
-        if obj["Size"] == 0:                      # ← skip empty / partial uploads
+        # ---------------------------------------------------------------
+
+        if not key.lower().endswith(".pdf"):
             continue
         doc_id = Path(key).stem
-        done_tag = LOCAL_IN / f".done_{doc_id}"
-        if not done_tag.exists():
+        done_flag = LOCAL_IN / f".done_{doc_id}"
+        if not done_flag.exists():
             yield doc_id, key
+
 
 
 def run_extractor(local_pdf: Path, doc_id: str):
