@@ -38,14 +38,18 @@ LOCAL_OUT.mkdir(exist_ok=True)
 # 1. Helpers                                                                  #
 # --------------------------------------------------------------------------- #
 def list_new_uploads():
-    """Yield (doc_id, s3_key) for every file in uploads/ we haven't touched."""
     resp = s3.list_objects_v2(Bucket=BUCKET, Prefix="uploads/")
     for obj in resp.get("Contents", []):
-        key     = obj["Key"]                          # uploads/<uuid>.pdf
-        doc_id  = Path(key).stem
+        key = obj["Key"]
+        if not key.lower().endswith(".pdf"):      # ← skip “folder objects”
+            continue
+        if obj["Size"] == 0:                      # ← skip empty / partial uploads
+            continue
+        doc_id = Path(key).stem
         done_tag = LOCAL_IN / f".done_{doc_id}"
         if not done_tag.exists():
             yield doc_id, key
+
 
 def run_extractor(local_pdf: Path, doc_id: str):
     """Call extract_cli.py then make_pdf.py *from the repo root*."""
