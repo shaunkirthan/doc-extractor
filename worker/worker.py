@@ -55,7 +55,7 @@ def main_loop(poll_interval=5):
     while True:
         print("🔄 Polling S3 for new PDFs...", flush=True)
 
-        for doc_id, key in list_uploaded_pdfs():
+        for doc_id, key in list_new_uploads():
             if doc_id in seen:
                 continue
 
@@ -66,7 +66,7 @@ def main_loop(poll_interval=5):
             try:
                 run_extractor(local_pdf, doc_id)          # pass Path OK
                 sync_results_to_s3(doc_id)
-                mark_backend_done(doc_id)                 # or notify_backend
+                notify_backend(doc_id)                 # or notify_backend
                 (LOCAL_IN / f".done_{doc_id}").touch()
                 seen.add(doc_id)                          # remember it
                 print(f"✅ {doc_id} done")
