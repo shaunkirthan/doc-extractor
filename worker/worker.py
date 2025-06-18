@@ -1,83 +1,115 @@
 #!/usr/bin/env python
-import os, time, subprocess, json, tempfile
-import boto3, requests
-from dotenv import load_dotenv
+"""
+worker.py – watches the S3 uploads/ prefix, downloads new PDFs,
+runs extract_cli.py + make_pdf.py, syncs the results back to S3,
+and notifies the FastAPI backend.
+
+Put this file in    <repo_root>/worker/worker.py
+"""
+
+import os, time, subprocess, json
 from pathlib import Path
 
-load_dotenv()
+import boto3, requests
+from dotenv import load_dotenv
 
-REGION  = os.environ["AWS_REGION"]
-BUCKET  = os.environ["BUCKET"]
-API     = os.environ["BACKEND_BASE"].rstrip("/")
-s3      = boto3.client("s3", region_name=REGION)
+# --------------------------------------------------------------------------- #
+# 0. Load configuration                                                       #
+# --------------------------------------------------------------------------- #
+load_dotenv()                                              # reads .env in repo root
 
-LOCAL_IN  = Path("input_pdfs")
-LOCAL_OUT = Path("output_sync")      # temp folder for uploads
+REGION   = os.environ["AWS_REGION"]        # e.g. us-east-1
+BUCKET   = os.environ["BUCKET"]            # e.g. pdf-extract-demo
+API_BASE = os.environ["BACKEND_BASE"].rstrip("/")  # http://localhost:8000
+
+s3   = boto3.client("s3", region_name=REGION)
+
+# repo_root  = one level **above** the folder this script lives in
+REPO_ROOT   = Path(__file__).resolve().parent.parent
+EXTRACT_CLI = REPO_ROOT / "extract_cli.py"
+MAKE_PDF    = REPO_ROOT / "make_pdf.py"
+
+LOCAL_IN    = REPO_ROOT / "input_pdfs"
+LOCAL_OUT   = REPO_ROOT / "output_sync"       # just a temp staging dir
 LOCAL_IN.mkdir(exist_ok=True)
 LOCAL_OUT.mkdir(exist_ok=True)
 
+# --------------------------------------------------------------------------- #
+# 1. Helpers                                                                  #
+# --------------------------------------------------------------------------- #
 def list_new_uploads():
-    """Return list of (doc_id, s3_key) that haven’t been processed yet."""
+    """Yield (doc_id, s3_key) for every file in uploads/ we haven't touched."""
     resp = s3.list_objects_v2(Bucket=BUCKET, Prefix="uploads/")
     for obj in resp.get("Contents", []):
-        key = obj["Key"]
-        doc_id = Path(key).stem                # uploads/<doc_id>.pdf
-        flag = LOCAL_IN / f".done_{doc_id}"
-        if not flag.exists():
+        key     = obj["Key"]                          # uploads/<uuid>.pdf
+        doc_id  = Path(key).stem
+        done_tag = LOCAL_IN / f".done_{doc_id}"
+        if not done_tag.exists():
             yield doc_id, key
 
-def run_extractor(local_pdf, doc_id):
-    # ✂️  call your existing script exactly as you do now
-    subprocess.run(["python", "extract_cli.py", local_pdf], check=True)
-    subprocess.run(["python", "make_pdf.py",  doc_id],     check=True)
+def run_extractor(local_pdf: Path, doc_id: str):
+    """Call extract_cli.py then make_pdf.py *from the repo root*."""
+    subprocess.run(
+        ["python", str(EXTRACT_CLI), str(local_pdf)],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    subprocess.run(
+        ["python", str(MAKE_PDF),  doc_id],
+        cwd=REPO_ROOT,
+        check=True,
+    )
 
-def sync_results_to_s3(doc_id):
+def sync_results_to_s3(doc_id: str):
     base_remote = f"results/{doc_id}"
-    # raw imgs / csv already written by extract_cli.py
-    subprocess.run(["aws","s3","sync",
-                    f"output_images/{doc_id}", f"s3://{BUCKET}/{base_remote}/images"],
-                   check=True)
-    subprocess.run(["aws","s3","sync",
-                    f"output_csv/{doc_id}",    f"s3://{BUCKET}/{base_remote}/tables"],
-                   check=True)
-    subprocess.run(["aws","s3","cp",
-                    f"output_images/{doc_id}/report.pdf",
-                    f"s3://{BUCKET}/{base_remote}/report.pdf"],
-                   check=True)
+    subprocess.run(
+        ["aws","s3","sync",
+         f"output_images/{doc_id}", f"s3://{BUCKET}/{base_remote}/images"],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    subprocess.run(
+        ["aws","s3","sync",
+         f"output_csv/{doc_id}", f"s3://{BUCKET}/{base_remote}/tables"],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    subprocess.run(
+        ["aws","s3","cp",
+         f"output_images/{doc_id}/report.pdf",
+         f"s3://{BUCKET}/{base_remote}/report.pdf"],
+        cwd=REPO_ROOT,
+        check=True,
+    )
 
-def notify_backend(doc_id):
-    url = f"{API}/internal/mark_done"
+def notify_backend(doc_id: str):
+    """POST {doc_id} to /internal/mark_done so FastAPI flips status → done."""
+    url = f"{API_BASE}/internal/mark_done"
     requests.post(url, json={"doc_id": doc_id}, timeout=5)
 
-def main_loop(poll_interval=5):
-    seen = set()
-
+# --------------------------------------------------------------------------- #
+# 2. Main polling loop                                                        #
+# --------------------------------------------------------------------------- #
+def main_loop(poll_interval: int = 5):
+    print(f"👀 Worker started. Watching s3://{BUCKET}/uploads/ every {poll_interval}s")
     while True:
-        print("🔄 Polling S3 for new PDFs...", flush=True)
-
         for doc_id, key in list_new_uploads():
-            if doc_id in seen:
-                continue
-
-            print(f"📥 Processing {doc_id}")
+            print(f"📥  Found new upload: {doc_id}")
             local_pdf = LOCAL_IN / f"{doc_id}.pdf"
-            s3.download_file(Bucket=BUCKET, Key=key, Filename=str(local_pdf))
+            s3.download_file(BUCKET, key, str(local_pdf))
 
             try:
-                run_extractor(local_pdf, doc_id)          # pass Path OK
+                run_extractor(local_pdf, doc_id)
                 sync_results_to_s3(doc_id)
-                notify_backend(doc_id)                 # or notify_backend
-                (LOCAL_IN / f".done_{doc_id}").touch()
-                seen.add(doc_id)                          # remember it
-                print(f"✅ {doc_id} done")
+                notify_backend(doc_id)
+                (LOCAL_IN / f".done_{doc_id}").touch()      # create flag
+                print(f"✅  {doc_id} processed & uploaded")
+            except subprocess.CalledProcessError as e:
+                print(f"❌  Extractor failed for {doc_id}: {e}")
             except Exception as e:
-                print(f"❌ error on {doc_id}: {e}")
+                print(f"❌  Unexpected error for {doc_id}: {e}")
 
         time.sleep(poll_interval)
-        
 
 if __name__ == "__main__":
     main_loop(poll_interval=5)
-
-
-
