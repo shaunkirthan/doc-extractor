@@ -49,24 +49,35 @@ def notify_backend(doc_id):
     url = f"{API}/internal/mark_done"
     requests.post(url, json={"doc_id": doc_id}, timeout=5)
 
-def main_loop():
+def main_loop(poll_interval=5):
+    seen = set()
+
     while True:
-        for doc_id, key in list_new_uploads():
-            print(f"Processing {doc_id}")
+        print("🔄 Polling S3 for new PDFs...", flush=True)
+
+        for doc_id, key in list_uploaded_pdfs():
+            if doc_id in seen:
+                continue
+
+            print(f"📥 Processing {doc_id}")
             local_pdf = LOCAL_IN / f"{doc_id}.pdf"
             s3.download_file(Bucket=BUCKET, Key=key, Filename=str(local_pdf))
 
             try:
-                run_extractor(str(local_pdf), doc_id)
+                run_extractor(local_pdf, doc_id)          # pass Path OK
                 sync_results_to_s3(doc_id)
-                notify_backend(doc_id)
+                mark_backend_done(doc_id)                 # or notify_backend
                 (LOCAL_IN / f".done_{doc_id}").touch()
+                seen.add(doc_id)                          # remember it
                 print(f"✅ {doc_id} done")
             except Exception as e:
                 print(f"❌ error on {doc_id}: {e}")
 
-        time.sleep(15)
+        time.sleep(poll_interval)
+        
 
 if __name__ == "__main__":
-    main_loop()
+    main_loop(poll_interval=5)
+
+
 
